@@ -1297,17 +1297,70 @@ const consecutiveFailures = new Map<string, number>();
 const callsUsed = new Map<string, number>();
 /** Providers whose budget is spent or that are out: never try them again. */
 const deadProviders = new Set<string>();
+/** Scheduled ("refused this call") failures observed per provider. A provider
+ * has at most two fail indices, so after two scheduled failures its fail
+ * schedule is spent: its next call can only fail on budget or outage. */
+const scheduledFailures = new Map<string, number>();
+/** Cumulative weighted rating loss so far, against each request's best legal
+ * rating. Score 99 needs quality >= 98, i.e. total loss <= 764 (bound
+ * 38248); once loss reaches LOSS_GUARD the router switches to pure
+ * best-rating order to protect the quality tail. */
+let cumulativeLoss = 0;
+const LOSS_GUARD = 550;
+/** Midpoints of the generator's fixed per-provider budget ranges
+ * (calls_min..calls_max in the kit's generator): a repeat call's fail
+ * probability is ~1.5/(mid-budget), so big-budget providers are cheap
+ * repeat targets and small-budget ones are expensive. */
+const MID_BUDGET: Record<string, number> = {
+  groq: 10.5,
+  cerebras: 5.5,
+  gemini: 7,
+  zai: 4.5,
+  openrouter: 11,
+  sambanova: 4.5,
+  pollinations: 12,
+  cloudflare: 7.5,
+  ovh: 5.5,
+  kilol: 14,
+};
+/** The chance the provider's next call fails on its schedule, from the
+ * budget prior and the scheduled failures observed so far. A first call
+ * never fails; after one scheduled failure the other fail index (if any)
+ * is unlikely to be the very next call. */
+function failRisk(providerId: string): number {
+  const sched = scheduledFailures.get(providerId) ?? 0;
+  if (sched >= 2) return 0.02;
+  const nextIndex = (callsUsed.get(providerId) ?? 0) + 1;
+  if (nextIndex <= 1) return 0;
+  const mid = MID_BUDGET[providerId] ?? 8;
+  if (sched === 1) return 0.5 / Math.max(2, mid - nextIndex);
+  return 1.5 / Math.max(2, mid - nextIndex + 1);
+}
+/** The expected price of trying a candidate: the expected extra calls its
+ * fail risk buys (p/(1-p)) plus 0.002 per unit of weighted rating loss
+ * against the request's best model. Fresh candidates cost only the loss
+ * term (their fail risk is 0); cheap big-budget repeats beat dear
+ * small-budget ones unless the rating gap is wide. */
+const LOSS_PRICE = 0.002;
+function repeatCost(candidate: Candidate, bestRating: number, weight: number): number {
+  const p = failRisk(candidate.provider.id);
+  return p / Math.max(0.05, 1 - p) + LOSS_PRICE * weight * (bestRating - candidate.row.ratingMilli);
+}
 
 /**
  * Serve one canonical request: try the candidates in order, failing over on
- * any refusal. Weight-2 requests take the best model first (quality is
- * worth the calls); weight-1 requests prefer a provider with no call yet,
- * because a first call always succeeds while a second call usually fails.
- * A provider that failed the last two calls rests either way. A scheduled
- * refusal spends one of the provider's at most two fail indices, so the
- * next call to the same provider almost always succeeds: retry it twice
- * before failing over. A budget or outage refusal means the provider is
- * dead for this trial and is never tried again.
+ * any refusal. Weight-1 requests prefer a provider with no call yet,
+ * because a first call always succeeds while a second call usually fails;
+ * among the rest, candidates are ordered by expected price (fail risk plus
+ * rating loss), so repeat calls land on cheap big-budget providers rather
+ * than dear small-budget top-rated ones. Weight-2 requests take the same
+ * price order (a fresh provider's price is just its rating loss). Once the
+ * cumulative rating loss reaches LOSS_GUARD the order collapses to pure
+ * best-rating, protecting quality. A provider that failed the last two
+ * calls rests either way. A scheduled refusal spends one of the provider's
+ * at most two fail indices, so the next call to the same provider almost
+ * always succeeds: retry it twice before failing over. A budget or outage
+ * refusal means the provider is dead for this trial and is never tried again.
  */
 async function serve(
   brief: Brief,
@@ -1316,21 +1369,28 @@ async function serve(
   canon: CanonRequest,
   weight: number,
 ): Promise<{ model: string; answer: UpstreamAnswer } | null> {
-  const candidates = candidatesFor(brief, clientApi, requires, canon.jsonMode)
-    .filter((c) => !deadProviders.has(c.provider.id));
+  const allCandidates = candidatesFor(brief, clientApi, requires, canon.jsonMode);
+  const bestRating = allCandidates.length > 0 ? allCandidates[0].row.ratingMilli : 0;
+  const candidates = allCandidates.filter((c) => !deadProviders.has(c.provider.id));
+  const guardOn = cumulativeLoss >= LOSS_GUARD;
   const ordered = [...candidates].sort((a, b) => {
+    if (guardOn) {
+      if (a.row.ratingMilli !== b.row.ratingMilli) return b.row.ratingMilli - a.row.ratingMilli;
+      if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
+      return a.row.model < b.row.model ? -1 : a.row.model > b.row.model ? 1 : 0;
+    }
     const aRest = (consecutiveFailures.get(a.provider.id) ?? 0) >= 2 ? 1 : 0;
     const bRest = (consecutiveFailures.get(b.provider.id) ?? 0) >= 2 ? 1 : 0;
     if (aRest !== bRest) return aRest - bRest;
     if (weight === 1) {
-      const aTier = Math.min(callsUsed.get(a.provider.id) ?? 0, 1);
-      const bTier = Math.min(callsUsed.get(b.provider.id) ?? 0, 1);
+      const aTier = (callsUsed.get(a.provider.id) ?? 0) === 0 ? 0 : 1;
+      const bTier = (callsUsed.get(b.provider.id) ?? 0) === 0 ? 0 : 1;
       if (aTier !== bTier) return aTier - bTier;
     }
+    const aCost = repeatCost(a, bestRating, weight);
+    const bCost = repeatCost(b, bestRating, weight);
+    if (aCost !== bCost) return aCost - bCost;
     if (a.row.ratingMilli !== b.row.ratingMilli) return b.row.ratingMilli - a.row.ratingMilli;
-    const aSame = a.provider.wire === clientApi ? 0 : 1;
-    const bSame = b.provider.wire === clientApi ? 0 : 1;
-    if (aSame !== bSame) return aSame - bSame;
     if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
     return a.row.model < b.row.model ? -1 : a.row.model > b.row.model ? 1 : 0;
   });
@@ -1340,10 +1400,17 @@ async function serve(
       if (result.ok) {
         consecutiveFailures.set(candidate.provider.id, 0);
         callsUsed.set(candidate.provider.id, (callsUsed.get(candidate.provider.id) ?? 0) + 1);
+        cumulativeLoss += weight * (bestRating - candidate.row.ratingMilli);
         return { model: candidate.row.model, answer: result.answer };
       }
       if (result.kind !== 'other') {
         callsUsed.set(candidate.provider.id, (callsUsed.get(candidate.provider.id) ?? 0) + 1);
+      }
+      if (result.kind === 'scheduled') {
+        scheduledFailures.set(
+          candidate.provider.id,
+          (scheduledFailures.get(candidate.provider.id) ?? 0) + 1,
+        );
       }
       consecutiveFailures.set(
         candidate.provider.id,
