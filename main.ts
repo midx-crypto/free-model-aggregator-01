@@ -1256,9 +1256,11 @@ function candidatesFor(
   }
   out.sort((a, b) => {
     if (a.row.ratingMilli !== b.row.ratingMilli) return b.row.ratingMilli - a.row.ratingMilli;
-    // A tie goes to the same provider every time (its id, alphabetically),
-    // so usage concentrates on one provider until it is spent instead of
-    // pushing two providers, each in turn, onto their own failure schedule.
+    // A tie goes to the wire the client already speaks (no translation),
+    // then to the provider and model ids, so the order is deterministic.
+    const aSame = a.provider.wire === clientApi ? 0 : 1;
+    const bSame = b.provider.wire === clientApi ? 0 : 1;
+    if (aSame !== bSame) return aSame - bSame;
     if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
     return a.row.model < b.row.model ? -1 : a.row.model > b.row.model ? 1 : 0;
   });
