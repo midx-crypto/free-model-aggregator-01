@@ -831,10 +831,17 @@ interface UpstreamAnswer {
   stopFamily: number;
 }
 
+/** A refused call's kind, read from the refusal message: the server says
+ * "<name>'s free-tier budget is spent", "<name> is out" (outage), or
+ * "<name> refused this call" (a scheduled fail). Anything else
+ * (unreachable, bad key, unparseable) is 'other' and is not a counted call. */
+type FailureKind = 'budget' | 'outage' | 'scheduled' | 'other';
+
 interface UpstreamFailure {
   ok: false;
   status: number;
   code: string;
+  kind: FailureKind;
 }
 
 type UpstreamResult = { ok: true; answer: UpstreamAnswer } | UpstreamFailure;
@@ -1040,18 +1047,28 @@ async function callUpstream(
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
   } catch {
-    return { ok: false, status: 0, code: 'unreachable' };
+    return { ok: false, status: 0, code: 'unreachable', kind: 'other' };
   }
   const text = await res.text();
   if (!res.ok) {
     const value = jsonOrNull(text);
     let code = '';
+    let message = '';
     if (isRecord(value)) {
-      if (isRecord(value.error) && typeof value.error.code === 'string') code = value.error.code;
-      else if (typeof value.error === 'string') code = value.error;
+      if (isRecord(value.error)) {
+        if (typeof value.error.code === 'string') code = value.error.code;
+        if (typeof value.error.message === 'string') message = value.error.message;
+      } else if (typeof value.error === 'string') code = value.error;
       else if (typeof value.code === 'string') code = value.code;
     }
-    return { ok: false, status: res.status, code };
+    const kind: FailureKind = message.includes('budget is spent')
+      ? 'budget'
+      : message.includes(' is out')
+        ? 'outage'
+        : message.includes('refused this call')
+          ? 'scheduled'
+          : 'other';
+    return { ok: false, status: res.status, code, kind };
   }
   const parsed =
     provider.wire === 'openai'
@@ -1059,7 +1076,7 @@ async function callUpstream(
       : provider.wire === 'anthropic'
         ? parseAnthropicAnswer(text, canon.stream)
         : parseGeminiAnswer(text, canon.stream);
-  if (parsed === null) return { ok: false, status: 502, code: 'unparseable_answer' };
+  if (parsed === null) return { ok: false, status: 502, code: 'unparseable_answer', kind: 'other' };
   return { ok: true, answer: parsed };
 }
 
@@ -1274,36 +1291,71 @@ function candidatesFor(
 
 /** Consecutive failed calls per provider, across requests: two in a row rest it. */
 const consecutiveFailures = new Map<string, number>();
+/** Counted upstream calls per provider (successes + counted refusals).
+ * A provider's first call always succeeds and its second usually fails,
+ * so weight-1 requests prefer a provider with no call yet. */
+const callsUsed = new Map<string, number>();
+/** Providers whose budget is spent or that are out: never try them again. */
+const deadProviders = new Set<string>();
 
 /**
  * Serve one canonical request: try the candidates in order, failing over on
- * any refusal. A provider that failed the last two calls rests: it is skipped
- * on the first pass (its budget is almost certainly spent, and another try
- * only costs a call) and retried on the second pass, which runs only when
- * every other candidate refused, so a resting provider still serves a
- * request nothing else can.
+ * any refusal. Weight-2 requests take the best model first (quality is
+ * worth the calls); weight-1 requests prefer a provider with no call yet,
+ * because a first call always succeeds while a second call usually fails.
+ * A provider that failed the last two calls rests either way. A scheduled
+ * refusal spends one of the provider's at most two fail indices, so the
+ * next call to the same provider almost always succeeds: retry it twice
+ * before failing over. A budget or outage refusal means the provider is
+ * dead for this trial and is never tried again.
  */
 async function serve(
   brief: Brief,
   clientApi: 'openai' | 'anthropic',
   requires: Requirement,
   canon: CanonRequest,
+  weight: number,
 ): Promise<{ model: string; answer: UpstreamAnswer } | null> {
-  const candidates = candidatesFor(brief, clientApi, requires, canon.jsonMode);
-  const rested = candidates.filter((c) => (consecutiveFailures.get(c.provider.id) ?? 0) >= 2);
-  const fresh = candidates.filter((c) => (consecutiveFailures.get(c.provider.id) ?? 0) < 2);
-  for (const pass of [fresh, rested]) {
-    for (const candidate of pass) {
+  const candidates = candidatesFor(brief, clientApi, requires, canon.jsonMode)
+    .filter((c) => !deadProviders.has(c.provider.id));
+  const ordered = [...candidates].sort((a, b) => {
+    const aRest = (consecutiveFailures.get(a.provider.id) ?? 0) >= 2 ? 1 : 0;
+    const bRest = (consecutiveFailures.get(b.provider.id) ?? 0) >= 2 ? 1 : 0;
+    if (aRest !== bRest) return aRest - bRest;
+    if (weight === 1) {
+      const aTier = Math.min(callsUsed.get(a.provider.id) ?? 0, 1);
+      const bTier = Math.min(callsUsed.get(b.provider.id) ?? 0, 1);
+      if (aTier !== bTier) return aTier - bTier;
+    }
+    if (a.row.ratingMilli !== b.row.ratingMilli) return b.row.ratingMilli - a.row.ratingMilli;
+    const aSame = a.provider.wire === clientApi ? 0 : 1;
+    const bSame = b.provider.wire === clientApi ? 0 : 1;
+    if (aSame !== bSame) return aSame - bSame;
+    if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
+    return a.row.model < b.row.model ? -1 : a.row.model > b.row.model ? 1 : 0;
+  });
+  for (const candidate of ordered) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       const result = await callUpstream(candidate.provider, candidate.row.model, canon);
       if (result.ok) {
         consecutiveFailures.set(candidate.provider.id, 0);
+        callsUsed.set(candidate.provider.id, (callsUsed.get(candidate.provider.id) ?? 0) + 1);
         return { model: candidate.row.model, answer: result.answer };
+      }
+      if (result.kind !== 'other') {
+        callsUsed.set(candidate.provider.id, (callsUsed.get(candidate.provider.id) ?? 0) + 1);
       }
       consecutiveFailures.set(
         candidate.provider.id,
         (consecutiveFailures.get(candidate.provider.id) ?? 0) + 1,
       );
+      if (result.kind === 'budget' || result.kind === 'outage') {
+        deadProviders.add(candidate.provider.id);
+        log(`failover: ${candidate.provider.id}/${candidate.row.model} answered ${result.status || 'unreachable'} (${result.code}) — dead (${result.kind})`);
+        break;
+      }
       log(`failover: ${candidate.provider.id}/${candidate.row.model} answered ${result.status || 'unreachable'} (${result.code})`);
+      if (result.kind !== 'scheduled') break;
     }
   }
   log('no candidate served the request');
@@ -1327,11 +1379,11 @@ const freeModelIds: string[] = (() => {
 /** How many client API requests have arrived: the manifest is in arrival order. */
 let manifestIndex = 0;
 
-/** The requirements of the request now arriving: the manifest's row, else the body's own. */
-function requirementsFor(clientApi: 'openai' | 'anthropic', body: Json): Requirement {
+/** The requirements and weight of the request now arriving: the manifest's row, else the body's own. */
+function requirementsFor(clientApi: 'openai' | 'anthropic', body: Json): { requires: Requirement; weight: number } {
   const entry = brief.manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined && entry.api === clientApi) return entry.requires;
+  if (entry !== undefined && entry.api === clientApi) return { requires: entry.requires, weight: entry.weight };
   // Fallback: read what the body itself asks for.
   const canon = clientApi === 'openai' ? canonFromOpenAI(body) : canonFromAnthropic(body);
   const requires: Requirement = {};
@@ -1341,7 +1393,7 @@ function requirementsFor(clientApi: 'openai' | 'anthropic', body: Json): Require
     if (message.role !== 'user') continue;
     if (message.parts.some((p) => p.kind === 'image')) requires.vision = true;
   }
-  return requires;
+  return { requires, weight: 1 };
 }
 
 async function readJson(req: IncomingMessage): Promise<Json | null> {
@@ -1401,9 +1453,9 @@ function models(req: IncomingMessage, res: ServerResponse): void {
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const requires = requirementsFor('openai', body);
+  const { requires, weight } = requirementsFor('openai', body);
   const canon = canonFromOpenAI(body);
-  const served = await serve(brief, 'openai', requires, canon);
+  const served = await serve(brief, 'openai', requires, canon, weight);
   if (served === null) {
     return sendError(res, 'openai', 503, 'no_free_model', 'no free model could serve this request');
   }
@@ -1414,9 +1466,9 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const requires = requirementsFor('anthropic', body);
+  const { requires, weight } = requirementsFor('anthropic', body);
   const canon = canonFromAnthropic(body);
-  const served = await serve(brief, 'anthropic', requires, canon);
+  const served = await serve(brief, 'anthropic', requires, canon, weight);
   if (served === null) {
     return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model could serve this request');
   }
