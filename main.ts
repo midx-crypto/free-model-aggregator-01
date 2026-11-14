@@ -1256,9 +1256,9 @@ function candidatesFor(
   }
   out.sort((a, b) => {
     if (a.row.ratingMilli !== b.row.ratingMilli) return b.row.ratingMilli - a.row.ratingMilli;
-    const aSame = a.provider.wire === clientApi ? 0 : 1;
-    const bSame = b.provider.wire === clientApi ? 0 : 1;
-    if (aSame !== bSame) return aSame - bSame;
+    // A tie goes to the same provider every time (its id, alphabetically),
+    // so usage concentrates on one provider until it is spent instead of
+    // pushing two providers, each in turn, onto their own failure schedule.
     if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
     return a.row.model < b.row.model ? -1 : a.row.model > b.row.model ? 1 : 0;
   });
@@ -1272,14 +1272,21 @@ function candidatesFor(
 
 /** Consecutive failed calls per provider, across requests: two in a row rest it. */
 const consecutiveFailures = new Map<string, number>();
+/** Failed calls per provider in all, across requests: two in all rest it too. */
+const totalFailures = new Map<string, number>();
+
+/** Whether a provider rests: it failed its last two calls, or two calls in all. */
+function isResting(providerId: string): boolean {
+  return (consecutiveFailures.get(providerId) ?? 0) >= 2 || (totalFailures.get(providerId) ?? 0) >= 2;
+}
 
 /**
  * Serve one canonical request: try the candidates in order, failing over on
- * any refusal. A provider that failed the last two calls rests: it is skipped
- * on the first pass (its budget is almost certainly spent, and another try
- * only costs a call) and retried on the second pass, which runs only when
- * every other candidate refused, so a resting provider still serves a
- * request nothing else can.
+ * any refusal. A provider that failed twice rests: it is skipped on the first
+ * pass (its budget is almost certainly spent, and another try only costs a
+ * call) and retried on the second pass, which runs only when every other
+ * candidate refused, so a resting provider still serves a request nothing
+ * else can.
  */
 async function serve(
   brief: Brief,
@@ -1288,8 +1295,8 @@ async function serve(
   canon: CanonRequest,
 ): Promise<{ model: string; answer: UpstreamAnswer } | null> {
   const candidates = candidatesFor(brief, clientApi, requires, canon.jsonMode);
-  const rested = candidates.filter((c) => (consecutiveFailures.get(c.provider.id) ?? 0) >= 2);
-  const fresh = candidates.filter((c) => (consecutiveFailures.get(c.provider.id) ?? 0) < 2);
+  const rested = candidates.filter((c) => isResting(c.provider.id));
+  const fresh = candidates.filter((c) => !isResting(c.provider.id));
   for (const pass of [fresh, rested]) {
     for (const candidate of pass) {
       const result = await callUpstream(candidate.provider, candidate.row.model, canon);
@@ -1301,6 +1308,7 @@ async function serve(
         candidate.provider.id,
         (consecutiveFailures.get(candidate.provider.id) ?? 0) + 1,
       );
+      totalFailures.set(candidate.provider.id, (totalFailures.get(candidate.provider.id) ?? 0) + 1);
       log(`failover: ${candidate.provider.id}/${candidate.row.model} answered ${result.status || 'unreachable'} (${result.code})`);
     }
   }
